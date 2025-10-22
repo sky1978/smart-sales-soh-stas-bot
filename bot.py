@@ -9,6 +9,7 @@ import redis
 import mysql.connector
 from mysql.connector import Error
 from datetime import datetime, timedelta
+from typing import Dict, Optional
 import pytz
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
@@ -29,7 +30,6 @@ VOICE_ID = os.getenv("VOICE_ID")
 TTS_PROVIDER = os.getenv("TTS_PROVIDER")  # "OPENAI" или "ELEVENLABS"
 MODEL_CHAT = os.getenv("MODEL_CHAT")
 MODEL_EVAL = os.getenv("MODEL_EVAL")
-BOT_PASSWORD = os.getenv("BOT_PASSWORD")
 
 # 🔹 Настройки Redis
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -110,21 +110,6 @@ def load_criteria(conn):
         logging.error(f"Failed to load criteria: {e}")
         return []
 
-def get_sale_points(conn):
-    try:
-        cur = conn.cursor(dictionary=True)
-        cur.execute(
-            "SELECT sale_point_id, display_name FROM sale_points WHERE organization_id=%s AND is_active=1 ORDER BY sale_point_id",
-            (ORG_ID,),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-    except Error as e:
-        logging.error(f"Failed to load sale points: {e}")
-        return []
-
-
 def load_supervisor_prompt(conn):
     try:
         cur = conn.cursor(dictionary=True)
@@ -141,24 +126,133 @@ def load_supervisor_prompt(conn):
     return None, None
 
 
-# 🔹 Проверка и сохранение авторизации пользователя
-def is_authorized(chat_id):
-    return redis_client.get(f"auth:{chat_id}") == "1"
+def validate_employee(employee_id: str, password: str) -> Optional[Dict[str, str]]:
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            """
+            SELECT employee_id, organization_id, sale_point_id, first_name, last_name, password
+            FROM employees
+            WHERE employee_id=%s AND organization_id=%s AND is_active=1
+            """,
+            (employee_id, ORG_ID),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        if row.get("password") != password:
+            return None
+        sale_point_id = row.get("sale_point_id")
+        if sale_point_id is None:
+            logging.error("Employee %s does not have an assigned sale point", employee_id)
+            return None
+        return {
+            "employee_id": str(row.get("employee_id", "")),
+            "organization_id": str(row.get("organization_id", "")),
+            "sale_point_id": str(sale_point_id),
+            "first_name": row.get("first_name", ""),
+            "last_name": row.get("last_name", ""),
+        }
+    except Error as e:
+        logging.error(f"Failed to validate employee: {e}")
+        return None
+    finally:
+        conn.close()
 
 
-def set_authorized(chat_id):
-    redis_client.set(f"auth:{chat_id}", "1")
+# 🔹 Управление состоянием авторизации и сессией пользователя
+STATE_AWAIT_EMPLOYEE = "await_employee"
+STATE_AWAIT_PASSWORD = "await_password"
+STATE_DIALOG = "dialog"
 
 
-def awaiting_password(chat_id):
-    return redis_client.get(f"await_pass:{chat_id}") == "1"
+def _state_key(chat_id: int) -> str:
+    return f"state:{chat_id}"
 
 
-def set_await_password(chat_id, value=True):
-    if value:
-        redis_client.set(f"await_pass:{chat_id}", "1")
+def _session_key(chat_id: int) -> str:
+    return f"session:{chat_id}"
+
+
+def set_state(chat_id: int, state: Optional[str]) -> None:
+    key = _state_key(chat_id)
+    if state is None:
+        redis_client.delete(key)
     else:
-        redis_client.delete(f"await_pass:{chat_id}")
+        redis_client.set(key, state)
+
+
+def get_state(chat_id: int) -> Optional[str]:
+    return redis_client.get(_state_key(chat_id))
+
+
+def clear_state(chat_id: int) -> None:
+    redis_client.delete(_state_key(chat_id))
+
+
+def set_session_values(chat_id: int, values: Dict[str, Optional[str]]) -> None:
+    if not values:
+        return
+    mapping = {k: v for k, v in values.items() if v is not None}
+    if mapping:
+        redis_client.hset(_session_key(chat_id), mapping=mapping)
+
+
+def get_session(chat_id: int) -> Dict[str, str]:
+    return redis_client.hgetall(_session_key(chat_id))
+
+
+def clear_session(chat_id: int) -> None:
+    redis_client.delete(_session_key(chat_id))
+
+
+def clear_session_field(chat_id: int, field: str) -> None:
+    redis_client.hdel(_session_key(chat_id), field)
+
+
+def is_authorized(chat_id: int) -> bool:
+    session = get_session(chat_id)
+    return bool(session.get("employee_id"))
+
+
+async def ask_employee_id(chat_id: int) -> None:
+    clear_session(chat_id)
+    set_state(chat_id, STATE_AWAIT_EMPLOYEE)
+    redis_client.delete(f"evaluated:{chat_id}")
+    redis_client.delete(f"start_time:{chat_id}")
+    redis_client.delete(get_conversation_key(chat_id))
+    await bot.send_message(chat_id, "Введите ваш ID продавца:", reply_markup=types.ReplyKeyboardRemove())
+
+
+async def ask_password(chat_id: int) -> None:
+    set_state(chat_id, STATE_AWAIT_PASSWORD)
+    await bot.send_message(chat_id, "Введите пароль:")
+
+
+async def prepare_new_dialog(chat_id: int) -> None:
+    session = get_session(chat_id)
+    employee_id = session.get("employee_id")
+    sale_point_id = session.get("sale_point_id")
+    if not employee_id:
+        await ask_employee_id(chat_id)
+        return
+    if not sale_point_id:
+        await bot.send_message(chat_id, "Для вашего аккаунта не указана точка продаж. Обратитесь к администратору.")
+        return
+    tz = pytz.timezone("Europe/Moscow")
+    redis_client.set(f"start_time:{chat_id}", datetime.now(tz).isoformat())
+    redis_client.delete(f"evaluated:{chat_id}")
+    init_conversation_history(chat_id)
+    set_state(chat_id, STATE_DIALOG)
+    await bot.send_message(
+        chat_id,
+        "Все готово, чтобы начать новый диалог! Напомню, что я покупатель, который зашел в магазин разливного пива. "
+        "А вы продавец. Итак, произнесите вашу первую фразу (вы можете писать текстом или записывать голосовые сообщения).",
+    )
 
 
 # 🔹 Параметры для истории чата
@@ -273,7 +367,7 @@ def generate_audio_elevenlabs(text):
     return temp_audio_path
 
 # 🔹 Функция оценки диалога
-def evaluate_conversation(chat_id, sale_point_id, start_time_str):
+def evaluate_conversation(chat_id, sale_point_id, employee_id, start_time_str):
     history = get_conversation_history(chat_id)
 
     if len(history) <= 1:
@@ -324,7 +418,7 @@ def evaluate_conversation(chat_id, sale_point_id, start_time_str):
         try:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO dialog_chunks (date, start_datetime, end_datetime, filename, organization_id, sale_point_id) VALUES (%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO dialog_chunks (date, start_datetime, end_datetime, filename, organization_id, sale_point_id, employee_id) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                 (
                     chunk_date,
                     start_dt.strftime('%Y-%m-%d %H:%M:%S'),
@@ -332,6 +426,7 @@ def evaluate_conversation(chat_id, sale_point_id, start_time_str):
                     filename,
                     ORG_ID,
                     sale_point_id,
+                    employee_id,
                 ),
             )
             chunk_id = cur.lastrowid
@@ -343,7 +438,7 @@ def evaluate_conversation(chat_id, sale_point_id, start_time_str):
             cur.execute(
                 "INSERT INTO analysis_versions (description, prompt_id) VALUES (%s,%s)",
                 (
-                    f"Sale_point: {sale_point_id} Chat_id: {chat_id} Bot-Stas: yes",
+                    f"Sale_point: {sale_point_id} Employee: {employee_id} Chat_id: {chat_id} Bot-Stas: yes",
                     prompt_id,
                 ),
             )
@@ -428,73 +523,24 @@ def evaluate_conversation(chat_id, sale_point_id, start_time_str):
 @dp.message_handler(commands=['start'])
 async def handle_start(message: types.Message):
     chat_id = message.chat.id
-
     if not is_authorized(chat_id):
-        set_await_password(chat_id, True)
-        await message.answer("Введите пароль для доступа:")
+        await ask_employee_id(chat_id)
         return
+    await prepare_new_dialog(chat_id)
 
-    conn = get_db_connection()
-    if not conn:
-        await message.answer("Ошибка подключения к базе данных")
-        return
-    sale_points = get_sale_points(conn)
-    conn.close()
-
-    if not sale_points:
-        await message.answer("Не удалось получить список филиалов")
-        return
-
-    keyboard = types.InlineKeyboardMarkup()
-    for sp in sale_points:
-        keyboard.add(types.InlineKeyboardButton(sp["display_name"], callback_data=f"sp:{sp['sale_point_id']}"))
-
-    await message.answer("Выберите филиал пиццерии:", reply_markup=keyboard)
-
-
-@dp.message_handler(lambda message: awaiting_password(message.chat.id), content_types=types.ContentType.TEXT)
-async def handle_password(message: types.Message):
-    chat_id = message.chat.id
-    if message.text.strip() == (BOT_PASSWORD or ""):
-        set_authorized(chat_id)
-        set_await_password(chat_id, False)
-        await message.answer("Пароль принят!")
-        await handle_start(message)
-    else:
-        await message.answer("Неверный пароль. Попробуйте еще раз:")
-
-@dp.callback_query_handler(lambda c: c.data.startswith('sp:'))
-async def process_sale_point(callback_query: types.CallbackQuery):
-    chat_id = callback_query.message.chat.id
-    if not is_authorized(chat_id):
-        await bot.answer_callback_query(callback_query.id)
-        await bot.send_message(chat_id, "Введите пароль командой /start")
-        return
-    sale_point_id = callback_query.data.split(':')[1]
-    redis_client.set(f"sale_point:{chat_id}", sale_point_id)
-    tz = pytz.timezone("Europe/Moscow")
-    redis_client.set(f"start_time:{chat_id}", datetime.now(tz).isoformat())
-    redis_client.delete(f"evaluated:{chat_id}")
-    init_conversation_history(chat_id)
-    await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(chat_id, "Все готово, чтобы начать новый диалог! Напомню, что я покупатель, который зашел в магазин разливного пива. А вы продавец. Итак, произнесите вашу первую фразу (вы можете писать текстом или записывать голосовые сообщения).")
-
-
-# 🔹 Фолбэк для необработанных callback-запросов
-@dp.callback_query_handler(lambda c: True)
-async def fallback_callback_handler(callback_query: types.CallbackQuery):
-    await callback_query.answer()
 
 # 🔹 Обработчик команды /evaluate
 @dp.message_handler(commands=["evaluate"])
 async def handle_evaluate(message: types.Message):
     chat_id = message.chat.id
     if not is_authorized(chat_id):
-        await message.answer("Введите пароль командой /start")
+        await ask_employee_id(chat_id)
         return
-    sale_point_id = redis_client.get(f"sale_point:{chat_id}")
+    session = get_session(chat_id)
+    sale_point_id = session.get("sale_point_id")
+    employee_id = session.get("employee_id")
     start_time = redis_client.get(f"start_time:{chat_id}")
-    if not sale_point_id or not start_time:
+    if not sale_point_id or not start_time or not employee_id:
         await message.answer("Начните новый диалог командой /start")
         return
 
@@ -518,7 +564,7 @@ async def handle_evaluate(message: types.Message):
             return
 
     await message.answer("⏳ Оцениваю диалог...")
-    evaluation = evaluate_conversation(chat_id, sale_point_id, start_time)
+    evaluation = evaluate_conversation(chat_id, sale_point_id, employee_id, start_time)
     redis_client.set(f"evaluated:{chat_id}", "1")
     await message.answer(f"📊 Оценка диалога:\n\n{evaluation}")
 
@@ -526,19 +572,51 @@ async def handle_evaluate(message: types.Message):
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_text(message: types.Message):
     chat_id = message.chat.id
-    if awaiting_password(chat_id):
-        await handle_password(message)
+    text = message.text.strip() if message.text else ""
+    state = get_state(chat_id)
+    if state == STATE_AWAIT_EMPLOYEE:
+        if not text:
+            await message.answer("ID продавца не может быть пустым. Попробуйте снова.")
+            return
+        set_session_values(chat_id, {"pending_employee_id": text})
+        await ask_password(chat_id)
+        return
+    if state == STATE_AWAIT_PASSWORD:
+        session = get_session(chat_id)
+        employee_id = session.get("pending_employee_id")
+        if not employee_id:
+            await ask_employee_id(chat_id)
+            return
+        employee = validate_employee(employee_id, text)
+        if not employee:
+            await message.answer("Неверный ID или пароль. Попробуйте снова.")
+            await ask_employee_id(chat_id)
+            return
+        set_session_values(
+            chat_id,
+            {
+                "employee_id": employee.get("employee_id"),
+                "organization_id": employee.get("organization_id"),
+                "sale_point_id": employee.get("sale_point_id"),
+                "first_name": employee.get("first_name"),
+                "last_name": employee.get("last_name"),
+            },
+        )
+        clear_session_field(chat_id, "pending_employee_id")
+        await message.answer("Авторизация успешна.")
+        await prepare_new_dialog(chat_id)
         return
     if not is_authorized(chat_id):
-        await message.answer("Введите пароль командой /start")
+        await ask_employee_id(chat_id)
         return
     user_input = message.text
-    sale_point_id = redis_client.get(f"sale_point:{chat_id}")
+    session = get_session(chat_id)
+    sale_point_id = session.get("sale_point_id")
     if not sale_point_id:
-        await message.answer("Пожалуйста, начните новый диалог командой /start и выберите филиал")
+        await message.answer("Для вашего аккаунта не указана точка продаж. Обратитесь к администратору.")
         return
     await message.answer("⏳ Думаю...")
-    
+
     # Инициализируем историю (если ранее не было сообщений) и добавляем новое сообщение пользователя
     _ = get_conversation_history(chat_id)  # инициализация при необходимости
     append_message(chat_id, "user", user_input)
@@ -575,15 +653,17 @@ async def handle_text(message: types.Message):
 @dp.message_handler(content_types=types.ContentType.VOICE)
 async def handle_voice(message: types.Message):
     chat_id = message.chat.id
-    if awaiting_password(chat_id):
-        await message.answer("Введите пароль сначала")
+    state = get_state(chat_id)
+    if state in (STATE_AWAIT_EMPLOYEE, STATE_AWAIT_PASSWORD):
+        await message.answer("Сначала завершите авторизацию, отправив текстовые ответы.")
         return
     if not is_authorized(chat_id):
-        await message.answer("Введите пароль командой /start")
+        await ask_employee_id(chat_id)
         return
-    sale_point_id = redis_client.get(f"sale_point:{chat_id}")
+    session = get_session(chat_id)
+    sale_point_id = session.get("sale_point_id")
     if not sale_point_id:
-        await message.answer("Пожалуйста, начните новый диалог командой /start и выберите филиал")
+        await message.answer("Для вашего аккаунта не указана точка продаж. Обратитесь к администратору.")
         return
     file_info = await bot.get_file(message.voice.file_id)
     file_path = file_info.file_path
