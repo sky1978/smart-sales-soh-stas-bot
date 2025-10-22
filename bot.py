@@ -47,7 +47,7 @@ os.environ["HTTPS_PROXY"] = PROXY_URL
 os.environ["HTTP_PROXY"] = PROXY_URL
 
 # 🔹 Параметры организации и БД
-ORG_ID = os.getenv("ORG_ID", "7")
+ORG_ID = os.getenv("ORG_ID", "5")
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
     "database": os.getenv("DB_NAME", "dialog_analysis"),
@@ -477,7 +477,7 @@ async def process_sale_point(callback_query: types.CallbackQuery):
     redis_client.delete(f"evaluated:{chat_id}")
     init_conversation_history(chat_id)
     await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(chat_id, "Все готово, чтобы начать новый диалог! Напомню, что я покупатель, который дозвонился в пиццерию «Папа Джонс». А вы сотрудник, который принимает заказы по телефону. Итак, произнесите вашу первую фразу (вы можете писать текстом или записывать голосовые сообщения).")
+    await bot.send_message(chat_id, "Все готово, чтобы начать новый диалог! Напомню, что я покупатель, который зашел в магазин разливного пива. А вы продавец. Итак, произнесите вашу первую фразу (вы можете писать текстом или записывать голосовые сообщения).")
 
 
 # 🔹 Фолбэк для необработанных callback-запросов
@@ -638,7 +638,7 @@ async def handle_voice(message: types.Message):
         os.remove(audio_path)
 
 # 🔹 Обработчик вебхука
-@app.post("/webhook_ppd_stas_bot")
+@app.post("/webhook_soh_stas_bot")
 async def webhook(request: Request):
     update = await request.json()
     telegram_update = types.Update(**update)
@@ -647,7 +647,7 @@ async def webhook(request: Request):
 
 # 🔹 Настройка webhook
 async def on_startup():
-    webhook_url = "https://myuninet.ru/webhook_ppd_stas_bot"
+    webhook_url = "https://myuninet.ru/webhook_soh_stas_bot"
     await bot.set_webhook(webhook_url)
 
 async def on_shutdown():
@@ -659,4 +659,4 @@ if __name__ == "__main__":
     Bot.set_current(bot)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(on_startup())
-    uvicorn.run(app, host="0.0.0.0", port=8004)
+    uvicorn.run(app, host="0.0.0.0", port=8005)
